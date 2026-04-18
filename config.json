@@ -1,6 +1,6 @@
 {
     "service": "yandex",
-    "yandex_token": "ВАШ_ТОКЕН_ЯНДЕКСА",
+    "yandex_token": "y0__xDAgM7BBRjblgMgmOPYkBcw_86nmwjjIQt5fmvrEZu8NnpGpI0upgdDMw",
     "cache_dir": "/var/tmp/discohack_cache",
     "sync_enabled": false
 }
