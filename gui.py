@@ -1,46 +1,74 @@
-import sys
-import os
 import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+
+import requests
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QMimeData, QUrl
+from PyQt6.QtGui import QAction, QDrag, QIcon, QPixmap
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
-    QWidget, QPushButton, QFileDialog, QMessageBox, QSystemTrayIcon,
-    QMenu, QLabel, QDialog, QLineEdit, QInputDialog, QProgressBar,
-    QStatusBar, QTextEdit, QTabWidget, QListWidget, QAbstractItemView
+    QApplication,
+    QFileDialog,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QStatusBar,
+    QSystemTrayIcon,
+    QVBoxLayout,
+    QWidget,
+    QDialog,
+    QAbstractItemView,
+    QListView,
+    QMenu,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QAction, QIcon, QPixmap
 
 from yandex import YandexDisk
-from cache import FileCache
-from sync import start_sync
-from integration import mount_cloud, unmount_cloud, is_cloud_mounted
+
+
+def _safe_local_filename(name: str) -> str:
+    name = os.path.basename(name.replace("\\", "/"))
+    for c in '<>:"/\\|?*':
+        name = name.replace(c, "_")
+    return name or "file"
+
 
 class DownloadThread(QThread):
     progress = pyqtSignal(int, int)
     finished = pyqtSignal(bool, str)
-    
+
     def __init__(self, cloud, remote_path, local_path):
         super().__init__()
         self.cloud = cloud
         self.remote_path = remote_path
         self.local_path = local_path
-    
+
     def run(self):
         try:
             def progress_callback(downloaded, total):
                 self.progress.emit(downloaded, total)
+
             self.cloud.download_file(self.remote_path, self.local_path, progress_callback)
             self.finished.emit(True, "Скачивание завершено")
         except Exception as e:
             self.finished.emit(False, str(e))
+
 
 class CloudFileListWidget(QListWidget):
     def __init__(self, owner):
         super().__init__()
         self.owner = owner
         self.setAcceptDrops(True)
-        self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
+        self.setDragEnabled(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
         self.setDefaultDropAction(Qt.DropAction.CopyAction)
+        self.setMovement(QListView.Movement.Static)
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -64,11 +92,51 @@ class CloudFileListWidget(QListWidget):
             if url.isLocalFile():
                 paths.append(url.toLocalFile())
 
-        if paths:
-            self.owner.upload_paths(paths)
-            event.acceptProposedAction()
-        else:
+        if not paths:
             event.ignore()
+            return
+
+        action = event.dropAction()
+        if action == Qt.DropAction.IgnoreAction:
+            action = event.proposedDropAction()
+        move_sources = action == Qt.DropAction.MoveAction
+
+        self.owner.upload_paths(paths, ask_confirmation=False, delete_sources_after=move_sources)
+        event.setDropAction(Qt.DropAction.MoveAction if move_sources else Qt.DropAction.CopyAction)
+        event.accept()
+
+    def startDrag(self, supportedActions):
+        item = self.currentItem()
+        if not item:
+            return
+        name, is_dir = self.owner.parse_list_item(item.text())
+        if not name or is_dir:
+            return
+
+        remote_path = self.owner.remote_path_for_name(name)
+        tmpdir = tempfile.mkdtemp(prefix="discohack_drag_")
+        local_name = _safe_local_filename(name)
+        local_path = os.path.join(tmpdir, local_name)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self.owner.cloud.download_file(remote_path, local_path)
+        except Exception as e:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            QMessageBox.critical(self.owner, "Ошибка", str(e))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(local_path)])
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec(Qt.DropAction.CopyAction)
+
+        def cleanup():
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        QTimer.singleShot(120_000, cleanup)
 
 
 class CloudExplorer(QMainWindow):
@@ -82,26 +150,18 @@ class CloudExplorer(QMainWindow):
         self.ensure_token()
 
         self.cloud = YandexDisk(self.cfg["yandex_token"])
-        self.cache = FileCache(self.cfg.get("cache_dir", "/var/tmp/discohack_cache"))
-        self.sync_worker = None
         self.current_path = "/"
 
         self.setup_ui()
         self.setup_tray()
         self.setup_statusbar()
-        self.update_mount_status()
         self.load_cloud_files()
 
     def load_config(self):
         if os.path.exists(self.cfg_path):
             with open(self.cfg_path, "r", encoding="utf-8") as f:
                 return json.load(f)
-        return {
-            "service": "yandex",
-            "yandex_token": "",
-            "cache_dir": "/var/tmp/discohack_cache",
-            "sync_enabled": False
-        }
+        return {"service": "yandex", "yandex_token": ""}
 
     def save_config(self):
         with open(self.cfg_path, "w", encoding="utf-8") as f:
@@ -124,17 +184,7 @@ class CloudExplorer(QMainWindow):
         self.save_config()
 
     def setup_ui(self):
-        tabs = QTabWidget()
-        cloud_widget = self.create_cloud_tab()
-        tabs.addTab(cloud_widget, "Облако")
-
-        sync_widget = self.create_sync_tab()
-        tabs.addTab(sync_widget, "Синхронизация")
-
-        links_widget = self.create_links_tab()
-        tabs.addTab(links_widget, "Публичные ссылки")
-
-        self.setCentralWidget(tabs)
+        self.setCentralWidget(self.create_cloud_tab())
 
     def create_cloud_tab(self):
         widget = QWidget()
@@ -154,65 +204,8 @@ class CloudExplorer(QMainWindow):
         self.file_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.file_list.customContextMenuRequested.connect(self.show_file_context_menu)
 
-        hint = QLabel("Подсказка: перетащите файлы/папки в список для загрузки в текущую директорию облака.")
-
         layout.addLayout(path_layout)
         layout.addWidget(self.file_list)
-        layout.addWidget(hint)
-        widget.setLayout(layout)
-        return widget
-
-    def create_sync_tab(self):
-        widget = QWidget()
-        layout = QVBoxLayout()
-
-        self.sync_status = QLabel("Синхронизация не запущена")
-        self.sync_local_path = QLineEdit()
-        self.sync_local_path.setPlaceholderText("Путь к локальной папке (например /home/user/sync)")
-
-        self.sync_remote_path = QLineEdit()
-        self.sync_remote_path.setPlaceholderText("Путь в облаке (например /sync)")
-
-        btn_start_sync = QPushButton("Запустить синхронизацию")
-        btn_start_sync.clicked.connect(self.start_sync_folder)
-
-        btn_stop_sync = QPushButton("Остановить синхронизацию")
-        btn_stop_sync.clicked.connect(self.stop_sync)
-
-        self.mount_status = QLabel("Статус монтирования: неизвестно")
-        btn_mount = QPushButton("Смонтировать диск (GVfs)")
-        btn_mount.clicked.connect(self.mount_disk)
-        btn_unmount = QPushButton("Размонтировать диск")
-        btn_unmount.clicked.connect(self.unmount_disk)
-
-        layout.addWidget(QLabel("Локальная папка:"))
-        layout.addWidget(self.sync_local_path)
-        layout.addWidget(QLabel("Облачная папка:"))
-        layout.addWidget(self.sync_remote_path)
-        layout.addWidget(btn_start_sync)
-        layout.addWidget(btn_stop_sync)
-        layout.addWidget(self.sync_status)
-        layout.addWidget(self.mount_status)
-        layout.addWidget(btn_mount)
-        layout.addWidget(btn_unmount)
-        layout.addStretch()
-
-        widget.setLayout(layout)
-        return widget
-
-    def create_links_tab(self):
-        widget = QWidget()
-        layout = QVBoxLayout()
-
-        self.links_text = QTextEdit()
-        self.links_text.setReadOnly(True)
-        self.links_text.setPlaceholderText("Здесь будут созданные публичные ссылки")
-
-        btn_refresh_links = QPushButton("Обновить")
-        btn_refresh_links.clicked.connect(self.load_links)
-
-        layout.addWidget(btn_refresh_links)
-        layout.addWidget(self.links_text)
         widget.setLayout(layout)
         return widget
 
@@ -234,29 +227,11 @@ class CloudExplorer(QMainWindow):
         hide_action = QAction("Скрыть окно", self)
         hide_action.triggered.connect(self.hide)
 
-        auth_action = QAction("Авторизация (токен)", self)
-        auth_action.triggered.connect(self.configure_token)
-
-        mount_action = QAction("Добавить диск (mount)", self)
-        mount_action.triggered.connect(self.mount_disk)
-
-        unmount_action = QAction("Удалить диск (unmount)", self)
-        unmount_action.triggered.connect(self.unmount_disk)
-
-        sync_action = QAction("Запустить синхронизацию", self)
-        sync_action.triggered.connect(lambda: self.start_sync_folder())
-
         quit_action = QAction("Выйти", self)
         quit_action.triggered.connect(self.quit_app)
 
         tray_menu.addAction(show_action)
         tray_menu.addAction(hide_action)
-        tray_menu.addSeparator()
-        tray_menu.addAction(auth_action)
-        tray_menu.addAction(mount_action)
-        tray_menu.addAction(unmount_action)
-        tray_menu.addSeparator()
-        tray_menu.addAction(sync_action)
         tray_menu.addSeparator()
         tray_menu.addAction(quit_action)
 
@@ -293,20 +268,23 @@ class CloudExplorer(QMainWindow):
 
     def show_file_context_menu(self, pos):
         menu = QMenu(self)
-        actions = [
-            ("Обновить", self.load_cloud_files),
+        refresh = QAction("Обновить", self)
+        refresh.setToolTip(
+            "Запрашивает у сервера Яндекс.Диска актуальный список файлов и папок "
+            "в текущей директории и обновляет отображение в окне."
+        )
+        refresh.triggered.connect(self.load_cloud_files)
+        menu.addAction(refresh)
+        for title, callback in (
             ("Наверх", self.go_up),
-            ("Загрузить файл", self.upload_file),
+            ("Создать файл", self.create_empty_remote_file),
             ("Скачать", self.download_selected),
             ("Удалить", self.delete_selected),
             ("Предпросмотр", self.preview_selected),
-            ("Создать ссылку", self.share_selected),
-            ("Переместить", self.move_selected),
-        ]
-        for title, callback in actions:
-            action = QAction(title, self)
-            action.triggered.connect(callback)
-            menu.addAction(action)
+        ):
+            act = QAction(title, self)
+            act.triggered.connect(callback)
+            menu.addAction(act)
         menu.exec(self.file_list.mapToGlobal(pos))
 
     def load_cloud_files(self):
@@ -315,23 +293,23 @@ class CloudExplorer(QMainWindow):
             items = self.cloud.list_files(self.current_path)
             self.file_list.clear()
 
-            folders = [item for item in items if item.get('type') == 'dir']
-            files = [item for item in items if item.get('type') == 'file']
+            folders = [item for item in items if item.get("type") == "dir"]
+            files = [item for item in items if item.get("type") == "file"]
 
             for item in folders + files:
-                name = item.get('name', 'unknown')
-                item_type = item.get('type', 'file')
-                size = item.get('size', 0)
+                name = item.get("name", "unknown")
+                item_type = item.get("type", "file")
+                size = item.get("size", 0)
 
-                if item_type == 'dir':
+                if item_type == "dir":
                     display_text = f"📁 {name}/"
                 else:
                     if size < 1024:
                         size_str = f"{size} B"
-                    elif size < 1024*1024:
-                        size_str = f"{size/1024:.1f} KB"
+                    elif size < 1024 * 1024:
+                        size_str = f"{size / 1024:.1f} KB"
                     else:
-                        size_str = f"{size/(1024*1024):.1f} MB"
+                        size_str = f"{size / (1024 * 1024):.1f} MB"
                     display_text = f"📄 {name} ({size_str})"
 
                 self.file_list.addItem(display_text)
@@ -343,26 +321,37 @@ class CloudExplorer(QMainWindow):
             QMessageBox.critical(self, "Ошибка", f"Не удалось загрузить файлы: {e}")
             self.statusbar.showMessage(f"Ошибка: {e}", 5000)
 
+    def parse_list_item(self, text):
+        if text.startswith("📁 "):
+            return text[2:-1], True
+        if text.startswith("📄 "):
+            name_with_size = text[2:]
+            last_paren = name_with_size.rfind("(")
+            if last_paren > 0:
+                return name_with_size[:last_paren].strip(), False
+            return name_with_size, False
+        return None, False
+
     def on_item_double_click(self, item):
         text = item.text()
         if text.startswith("📁 "):
             name = text[2:-1]
-            self.current_path = self.current_path.rstrip('/') + '/' + name
+            self.current_path = self.current_path.rstrip("/") + "/" + name
             self.load_cloud_files()
         elif text.startswith("📄 "):
             self.download_selected()
 
     def go_up(self):
         if self.current_path != "/":
-            parent = os.path.dirname(self.current_path.rstrip('/'))
+            parent = os.path.dirname(self.current_path.rstrip("/"))
             self.current_path = parent if parent else "/"
             self.load_cloud_files()
 
     def go_to_path(self):
         path = self.path_input.text().strip()
         if path:
-            if not path.startswith('/'):
-                path = '/' + path
+            if not path.startswith("/"):
+                path = "/" + path
             self.current_path = path
             self.load_cloud_files()
             self.path_input.clear()
@@ -371,19 +360,11 @@ class CloudExplorer(QMainWindow):
         current = self.file_list.currentItem()
         if not current:
             return None
-        text = current.text()
-        if text.startswith("📁 "):
-            return text[2:-1]
-        elif text.startswith("📄 "):
-            name_with_size = text[2:]
-            last_paren = name_with_size.rfind('(')
-            if last_paren > 0:
-                return name_with_size[:last_paren].strip()
-            return name_with_size
-        return text
+        name, _ = self.parse_list_item(current.text())
+        return name
 
     def remote_path_for_name(self, name):
-        return self.current_path.rstrip('/') + '/' + name
+        return self.current_path.rstrip("/") + "/" + name
 
     def download_selected(self, local_path=None):
         name = self.get_selected_name()
@@ -402,12 +383,7 @@ class CloudExplorer(QMainWindow):
             self.thread.start()
             self.progress_bar.setVisible(True)
 
-    def upload_file(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Выберите файл")
-        if file_path:
-            self.upload_paths([file_path], ask_confirmation=True)
-
-    def upload_paths(self, paths, ask_confirmation=False):
+    def upload_paths(self, paths, ask_confirmation=False, delete_sources_after=False):
         if not paths:
             return
         all_files = []
@@ -423,23 +399,52 @@ class CloudExplorer(QMainWindow):
             return
 
         if ask_confirmation:
-            reply = QMessageBox.question(self, "Подтверждение", 
-                                        f"Загрузить {len(all_files)} файл(ов)\nв {self.current_path}?",
-                                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-
+            reply = QMessageBox.question(
+                self,
+                "Подтверждение",
+                f"Загрузить {len(all_files)} файл(ов)\nв {self.current_path}?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
             if reply != QMessageBox.StandardButton.Yes:
                 return
 
+        uploaded = []
         for file_path in all_files:
             try:
                 filename = os.path.basename(file_path)
-                remote_path = self.current_path.rstrip('/') + '/' + filename
+                remote_path = self.current_path.rstrip("/") + "/" + filename
                 self.cloud.upload_file(file_path, remote_path)
+                uploaded.append(file_path)
             except Exception as e:
                 QMessageBox.critical(self, "Ошибка", f"Не удалось загрузить {file_path}: {e}")
                 break
 
+        if delete_sources_after and uploaded:
+            for p in uploaded:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
         self.load_cloud_files()
+
+    def create_empty_remote_file(self):
+        name, ok = QInputDialog.getText(self, "Новый файл", "Имя файла на диске:")
+        if not ok:
+            return
+        name = name.strip().replace("\\", "/")
+        if not name:
+            return
+        name = os.path.basename(name)
+        if not re.match(r"^[^<>:\"/\\|?*]+\Z", name):
+            QMessageBox.warning(self, "Внимание", "Недопустимое имя файла.")
+            return
+        remote_path = self.current_path.rstrip("/") + "/" + name
+        try:
+            self.cloud.upload_bytes(b"", remote_path)
+            self.load_cloud_files()
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", str(e))
 
     def delete_selected(self):
         name = self.get_selected_name()
@@ -448,9 +453,12 @@ class CloudExplorer(QMainWindow):
             return
 
         remote_path = self.remote_path_for_name(name)
-        reply = QMessageBox.question(self, "Подтверждение", 
-                                    f"Удалить {name}?\nЭто действие нельзя отменить.",
-                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        reply = QMessageBox.question(
+            self,
+            "Подтверждение",
+            f"Удалить {name}?\nЭто действие нельзя отменить.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
         if reply == QMessageBox.StandardButton.Yes:
             try:
                 self.cloud.delete(remote_path)
@@ -465,14 +473,13 @@ class CloudExplorer(QMainWindow):
             return
 
         ext = os.path.splitext(name)[1].lower()
-        if ext not in ['.jpg', '.jpeg', '.png', '.gif', '.bmp']:
+        if ext not in [".jpg", ".jpeg", ".png", ".gif", ".bmp"]:
             QMessageBox.warning(self, "Предупреждение", "Это не изображение")
             return
 
         remote_path = self.remote_path_for_name(name)
         try:
             preview_url = self.cloud.get_preview(remote_path, "300x300")
-            import requests
             resp = requests.get(preview_url)
             if resp.status_code == 200:
                 preview_dialog = QDialog(self)
@@ -490,107 +497,6 @@ class CloudExplorer(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", str(e))
 
-    def share_selected(self):
-        name = self.get_selected_name()
-        if not name:
-            QMessageBox.warning(self, "Внимание", "Выберите элемент")
-            return
-
-        remote_path = self.remote_path_for_name(name)
-        try:
-            link = self.cloud.publish(remote_path)
-            self.links_text.append(f"{name}: {link}")
-            QMessageBox.information(self, "Ссылка создана", f"Публичная ссылка:\n{link}")
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка", str(e))
-
-    def move_selected(self):
-        name = self.get_selected_name()
-        if not name:
-            QMessageBox.warning(self, "Внимание", "Выберите элемент")
-            return
-
-        from_path = self.remote_path_for_name(name)
-        to_path, ok = QInputDialog.getText(self, "Переместить", 
-                                          f"Переместить {name}\nНовый путь в облаке:")
-        if ok and to_path:
-            if not to_path.startswith('/'):
-                to_path = '/' + to_path
-            try:
-                self.cloud.move(from_path, to_path)
-                self.load_cloud_files()
-            except Exception as e:
-                QMessageBox.critical(self, "Ошибка", str(e))
-
-    def configure_token(self):
-        token, ok = QInputDialog.getText(
-            self,
-            "Обновить токен",
-            "Введите OAuth токен Яндекс.Диска:",
-            QLineEdit.EchoMode.Normal,
-            self.cfg.get("yandex_token", ""),
-        )
-        if ok and token.strip():
-            self.cfg["yandex_token"] = token.strip()
-            self.save_config()
-            self.cloud = YandexDisk(self.cfg["yandex_token"])
-            QMessageBox.information(self, "Готово", "Токен обновлен.")
-
-    def update_mount_status(self):
-        mounted = is_cloud_mounted("yandex")
-        self.mount_status.setText(
-            "Статус монтирования: смонтирован" if mounted else "Статус монтирования: не смонтирован"
-        )
-
-    def mount_disk(self):
-        ok, message = mount_cloud("yandex")
-        if ok:
-            self.statusbar.showMessage(message, 4000)
-            self.tray_icon.showMessage("DiscoHack", message, QSystemTrayIcon.MessageIcon.Information, 2500)
-        else:
-            QMessageBox.warning(self, "Монтирование", message)
-        self.update_mount_status()
-
-    def unmount_disk(self):
-        ok, message = unmount_cloud("yandex")
-        if ok:
-            self.statusbar.showMessage(message, 4000)
-        else:
-            QMessageBox.warning(self, "Размонтирование", message)
-        self.update_mount_status()
-
-    def start_sync_folder(self):
-        local_dir = self.sync_local_path.text().strip()
-        remote_dir = self.sync_remote_path.text().strip()
-
-        if not local_dir or not remote_dir:
-            QMessageBox.warning(self, "Ошибка", "Укажите локальную и облачную папки")
-            return
-
-        if not os.path.exists(local_dir):
-            try:
-                os.makedirs(local_dir)
-            except Exception as e:
-                QMessageBox.critical(self, "Ошибка", f"Не могу создать локальную папку: {e}")
-                return
-
-        try:
-            self.stop_sync()
-            self.sync_worker = start_sync(self.cloud, local_dir, remote_dir, poll_interval=20)
-            self.sync_status.setText(f"Синхронизация запущена: {local_dir} ↔ {remote_dir}")
-            self.statusbar.showMessage("Двусторонняя синхронизация запущена", 4000)
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка", str(e))
-
-    def stop_sync(self):
-        if self.sync_worker:
-            self.sync_worker.stop()
-            self.sync_worker = None
-            self.sync_status.setText("Синхронизация остановлена")
-
-    def load_links(self):
-        self.links_text.append("--- Ссылки хранятся в истории ---")
-
     def update_progress(self, downloaded, total):
         if total > 0:
             percent = int(downloaded / total * 100)
@@ -605,10 +511,9 @@ class CloudExplorer(QMainWindow):
             QMessageBox.critical(self, "Ошибка", message)
 
     def quit_app(self):
-        if self.sync_worker:
-            self.sync_worker.stop()
         self.tray_icon.hide()
         QApplication.quit()
+
 
 def main():
     app = QApplication(sys.argv)
@@ -617,6 +522,7 @@ def main():
     window = CloudExplorer()
     window.hide()
     sys.exit(app.exec())
+
 
 if __name__ == "__main__":
     main()
