@@ -186,7 +186,21 @@ class CloudExplorer(QMainWindow):
         if os.path.exists(self.cfg_path):
             with open(self.cfg_path, "r", encoding="utf-8") as f:
                 return json.load(f)
-        return {"service": "yandex", "yandex_token": ""}
+        return {"service": "yandex", "yandex_token": "", "tray_notifications": True}
+
+    def notifications_enabled(self) -> bool:
+        return bool(self.cfg.get("tray_notifications", True))
+
+    def tray_show_message(
+        self,
+        title: str,
+        message: str,
+        icon=QSystemTrayIcon.MessageIcon.Information,
+        ms: int = 3000,
+    ):
+        if not self.notifications_enabled():
+            return
+        self.tray_icon.showMessage(title, message, icon, ms)
 
     def save_config(self):
         with open(self.cfg_path, "w", encoding="utf-8") as f:
@@ -252,23 +266,36 @@ class CloudExplorer(QMainWindow):
         hide_action = QAction("Скрыть окно", self)
         hide_action.triggered.connect(self.hide)
 
+        self._tray_notify_action = QAction("Уведомления", self)
+        self._tray_notify_action.setCheckable(True)
+        self._tray_notify_action.blockSignals(True)
+        self._tray_notify_action.setChecked(self.notifications_enabled())
+        self._tray_notify_action.blockSignals(False)
+        self._tray_notify_action.toggled.connect(self._on_tray_notifications_toggled)
+
         quit_action = QAction("Выйти", self)
         quit_action.triggered.connect(self.quit_app)
 
         tray_menu.addAction(show_action)
         tray_menu.addAction(hide_action)
         tray_menu.addSeparator()
+        tray_menu.addAction(self._tray_notify_action)
+        tray_menu.addSeparator()
         tray_menu.addAction(quit_action)
 
         self.tray_icon.setContextMenu(tray_menu)
         self.tray_icon.activated.connect(self.on_tray_activated)
         self.tray_icon.show()
-        self.tray_icon.showMessage(
+        self.tray_show_message(
             "DiscoHack",
             "Приложение запущено в tray. Нажмите по иконке для открытия.",
             QSystemTrayIcon.MessageIcon.Information,
             3000,
         )
+
+    def _on_tray_notifications_toggled(self, checked: bool):
+        self.cfg["tray_notifications"] = checked
+        self.save_config()
 
     def on_tray_activated(self, reason):
         if reason in (
@@ -284,7 +311,7 @@ class CloudExplorer(QMainWindow):
     def closeEvent(self, event):
         event.ignore()
         self.hide()
-        self.tray_icon.showMessage(
+        self.tray_show_message(
             "DiscoHack",
             "Окно скрыто в tray. Для выхода используйте меню иконки.",
             QSystemTrayIcon.MessageIcon.Information,

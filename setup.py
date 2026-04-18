@@ -8,7 +8,6 @@ setup(
         "requests",
         "PyQt6",
         "watchdog",
-        "notify2"
     ],
     entry_points={
         "console_scripts": [

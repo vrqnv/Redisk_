@@ -51,7 +51,7 @@ class YandexDisk:
                 if progress_callback and total_size:
                     progress_callback(downloaded, total_size)
 
-    def upload_file(self, local_path, remote_path, progress_callback=None):
+    def upload_file(self, local_path, remote_path):
         self._ensure_remote_parent_dirs(remote_path)
         url = f"{self.base_url}/resources/upload?path={remote_path}&overwrite=true"
         resp = requests.get(url, headers=self._headers())
