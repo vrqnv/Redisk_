@@ -3,10 +3,7 @@ import sys
 import os
 
 def main():
-    # Добавляем путь к проекту
     sys.path.insert(0, os.path.dirname(__file__))
-    
-    # Запускаем GUI
     from gui import main as gui_main
     gui_main()
 
