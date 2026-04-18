@@ -1,0 +1,4 @@
+requests>=2.28.0
+PyQt6>=6.4.0
+watchdog>=2.1.0
+notify2>=0.3.1

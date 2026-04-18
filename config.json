@@ -1,0 +1,6 @@
+{
+    "service": "yandex",
+    "yandex_token": "ВАШ_ТОКЕН_ЯНДЕКСА",
+    "cache_dir": "/var/tmp/discohack_cache",
+    "sync_enabled": false
+}
