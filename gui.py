@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
     QInputDialog,
+    QLabel,
     QLineEdit,
     QListWidget,
     QMainWindow,
@@ -252,7 +253,24 @@ class CloudExplorer(QMainWindow):
 
     def setup_tray(self):
         self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setIcon(QIcon.fromTheme("folder-remote"))
+        tray_icon = QIcon()
+        icon_path = os.path.join(os.path.dirname(__file__), "assets", "tray.png")
+        if os.path.exists(icon_path):
+            base = QPixmap(icon_path)
+            if not base.isNull():
+                for size in (16, 20, 24, 32, 48, 64):
+                    tray_icon.addPixmap(
+                        base.scaled(
+                            size,
+                            size,
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation,
+                        )
+                    )
+        if tray_icon.isNull():
+            tray_icon = QIcon.fromTheme("folder-remote")
+        self.tray_icon.setIcon(tray_icon)
+        self.setWindowIcon(tray_icon)
 
         tray_menu = QMenu()
         show_action = QAction("Показать окно", self)
