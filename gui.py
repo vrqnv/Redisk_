@@ -11,9 +11,7 @@ from PyQt6.QtGui import QAction, QDrag, QIcon, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
-    QHBoxLayout,
     QInputDialog,
-    QLabel,
     QLineEdit,
     QListWidget,
     QMainWindow,
@@ -176,6 +174,7 @@ class CloudExplorer(QMainWindow):
 
         self.cloud = YandexDisk(self.cfg["yandex_token"])
         self.current_path = "/"
+        self.current_items = []
 
         self.setup_ui()
         self.setup_tray()
@@ -229,13 +228,9 @@ class CloudExplorer(QMainWindow):
         widget = QWidget()
         layout = QVBoxLayout()
 
-        path_layout = QHBoxLayout()
-        self.path_label = QLabel("Текущий путь: /")
-        self.path_input = QLineEdit()
-        self.path_input.setPlaceholderText("Введите путь и нажмите Enter")
-        self.path_input.returnPressed.connect(self.go_to_path)
-        path_layout.addWidget(self.path_label)
-        path_layout.addWidget(self.path_input)
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Поиск по текущему каталогу...")
+        self.search_input.textChanged.connect(self.apply_search_filter)
 
         self.file_list = CloudFileListWidget(self)
         self.file_list.itemDoubleClicked.connect(self.on_item_double_click)
@@ -243,7 +238,7 @@ class CloudExplorer(QMainWindow):
         self.file_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.file_list.customContextMenuRequested.connect(self.show_file_context_menu)
 
-        layout.addLayout(path_layout)
+        layout.addWidget(self.search_input)
         layout.addWidget(self.file_list)
         widget.setLayout(layout)
         return widget
@@ -343,7 +338,7 @@ class CloudExplorer(QMainWindow):
         try:
             self.statusbar.showMessage(f"Загрузка {self.current_path}...")
             items = self.cloud.list_files(self.current_path)
-            self.file_list.clear()
+            self.current_items = []
 
             folders = [item for item in items if item.get("type") == "dir"]
             files = [item for item in items if item.get("type") == "file"]
@@ -364,9 +359,9 @@ class CloudExplorer(QMainWindow):
                         size_str = f"{size / (1024 * 1024):.1f} MB"
                     display_text = f"📄 {name} ({size_str})"
 
-                self.file_list.addItem(display_text)
+                self.current_items.append(display_text)
 
-            self.path_label.setText(f"Текущий путь: {self.current_path}")
+            self.apply_search_filter()
             self.statusbar.showMessage(f"Загружено {len(items)} элементов", 3000)
 
         except Exception as e:
@@ -399,14 +394,17 @@ class CloudExplorer(QMainWindow):
             self.current_path = parent if parent else "/"
             self.load_cloud_files()
 
-    def go_to_path(self):
-        path = self.path_input.text().strip()
-        if path:
-            if not path.startswith("/"):
-                path = "/" + path
-            self.current_path = path
-            self.load_cloud_files()
-            self.path_input.clear()
+    def apply_search_filter(self):
+        query = self.search_input.text().strip().lower()
+        self.file_list.clear()
+        if not query:
+            for item in self.current_items:
+                self.file_list.addItem(item)
+            return
+        for item in self.current_items:
+            name, _ = self.parse_list_item(item)
+            if name and query in name.lower():
+                self.file_list.addItem(item)
 
     def get_selected_name(self):
         current = self.file_list.currentItem()
