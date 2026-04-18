@@ -64,11 +64,69 @@ class CloudFileListWidget(QListWidget):
     def __init__(self, owner):
         super().__init__()
         self.owner = owner
+        self._dd_start_pos = None
+        self._dd_item = None
         self.setAcceptDrops(True)
-        self.setDragEnabled(True)
-        self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        self.setDragEnabled(False)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
         self.setDefaultDropAction(Qt.DropAction.CopyAction)
         self.setMovement(QListView.Movement.Static)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+
+    def mousePressEvent(self, event):
+        super().mousePressEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dd_start_pos = event.pos()
+            self._dd_item = self.itemAt(event.pos())
+
+    def mouseMoveEvent(self, event):
+        if (
+            event.buttons() & Qt.MouseButton.LeftButton
+            and self._dd_start_pos is not None
+            and (event.pos() - self._dd_start_pos).manhattanLength()
+            >= QApplication.startDragDistance()
+        ):
+            item = self._dd_item or self.itemAt(event.pos())
+            self._dd_start_pos = None
+            self._dd_item = None
+            if item:
+                name, is_dir = self.owner.parse_list_item(item.text())
+                if name and not is_dir:
+                    self._export_file_drag(name)
+                    return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._dd_start_pos = None
+        self._dd_item = None
+        super().mouseReleaseEvent(event)
+
+    def _export_file_drag(self, name: str):
+        remote_path = self.owner.remote_path_for_name(name)
+        tmpdir = tempfile.mkdtemp(prefix="discohack_drag_")
+        local_name = _safe_local_filename(name)
+        local_path = os.path.join(tmpdir, local_name)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self.owner.cloud.download_file(remote_path, local_path)
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            QMessageBox.critical(self.owner, "Ошибка", str(e))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(os.path.normpath(local_path))])
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec(Qt.DropAction.CopyAction)
+
+        def cleanup():
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        QTimer.singleShot(120_000, cleanup)
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -104,39 +162,6 @@ class CloudFileListWidget(QListWidget):
         self.owner.upload_paths(paths, ask_confirmation=False, delete_sources_after=move_sources)
         event.setDropAction(Qt.DropAction.MoveAction if move_sources else Qt.DropAction.CopyAction)
         event.accept()
-
-    def startDrag(self, supportedActions):
-        item = self.currentItem()
-        if not item:
-            return
-        name, is_dir = self.owner.parse_list_item(item.text())
-        if not name or is_dir:
-            return
-
-        remote_path = self.owner.remote_path_for_name(name)
-        tmpdir = tempfile.mkdtemp(prefix="discohack_drag_")
-        local_name = _safe_local_filename(name)
-        local_path = os.path.join(tmpdir, local_name)
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            self.owner.cloud.download_file(remote_path, local_path)
-        except Exception as e:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-            QMessageBox.critical(self.owner, "Ошибка", str(e))
-            return
-        finally:
-            QApplication.restoreOverrideCursor()
-
-        mime = QMimeData()
-        mime.setUrls([QUrl.fromLocalFile(local_path)])
-        drag = QDrag(self)
-        drag.setMimeData(mime)
-        drag.exec(Qt.DropAction.CopyAction)
-
-        def cleanup():
-            shutil.rmtree(tmpdir, ignore_errors=True)
-
-        QTimer.singleShot(120_000, cleanup)
 
 
 class CloudExplorer(QMainWindow):
